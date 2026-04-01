@@ -1,6 +1,6 @@
 use std::{fmt::Display, num::Wrapping};
 
-use crate::types::{Memory, RegByte, RegWord};
+use crate::types::{Condition, Flags, Memory, RegByte, RegWord};
 
 const GPR_COUNT: usize = 8;
 const RAM_SIZE: usize = 0x8000;
@@ -113,6 +113,7 @@ pub enum EmulatorError {
     MemoryLookupFail(u16),
     OpcodeUndefined(Vec<u8>),
     InvalidRegister(u8),
+    InvalidCondition(u8),
 }
 
 impl Display for EmulatorError {
@@ -121,6 +122,7 @@ impl Display for EmulatorError {
             Self::MemoryLookupFail(addr) => write!(f, "failed to get data at address {addr:04x}"),
             Self::OpcodeUndefined(op) => write!(f, "opcode {op:02x?} undefined"),
             Self::InvalidRegister(id) => write!(f, "no register {id}"),
+            Self::InvalidCondition(id) => write!(f, "no condition {id}"),
         }
     }
 }
@@ -133,40 +135,56 @@ pub mod opcode {
         opcode == 0x00
     }
 
-    /// A data opcode has bits [7:2] != 0b000001 (i.e. the `0x04` family is undefined).
+    /// A data opcode is of form 0b0000_11xx.
     pub const fn is_data(opcode: u8) -> bool {
-        opcode & 0xFC == 0x04
+        opcode & 0xFC == 0x0C
+    }
+
+    /// A jump opcode is of form 0b0000_10xx.
+    pub const fn is_jump(opcode: u8) -> bool {
+        opcode & 0xFC == 0x08
     }
 }
 
 impl Emulator {
+    fn push_next_opcode(&mut self, opcodes: &mut Vec<u8>) -> Result<(), EmulatorError> {
+        opcodes.push(
+            self.next_opcode()
+                .ok_or(EmulatorError::MemoryLookupFail(self.pc.0))?,
+        );
+        Ok(())
+    }
+
     pub fn step(&mut self) -> Result<(), EmulatorError> {
         use EmulatorError::*;
 
-        let opcode = vec![self.next_opcode().ok_or(MemoryLookupFail(self.pc.0))?];
+        let opcodes = vec![self.next_opcode().ok_or(MemoryLookupFail(self.pc.0))?];
 
-        if opcode::is_nop(opcode[0]) {
+        if opcode::is_nop(opcodes[0]) {
             // NOP - nothing to do.
             Ok(())
-        } else if opcode::is_data(opcode[0]) {
+        } else if opcode::is_data(opcodes[0]) {
             // One of LDI, MOV, LD, or STO.
-            self.step_data(opcode)
+            self.step_data(opcodes)
+        } else if opcode::is_jump(opcodes[0]) {
+            // JMP or JCC.
+            self.step_jump(opcodes)
         } else {
-            Err(OpcodeUndefined(opcode))
+            Err(OpcodeUndefined(opcodes))
         }
     }
 
-    fn step_data(&mut self, mut opcode: Vec<u8>) -> Result<(), EmulatorError> {
+    fn step_data(&mut self, mut opcodes: Vec<u8>) -> Result<(), EmulatorError> {
         use EmulatorError::*;
 
-        opcode.push(self.next_opcode().ok_or(MemoryLookupFail(self.pc.0))?);
+        self.push_next_opcode(&mut opcodes)?;
 
-        let is_word = opcode[0] & 0x02 != 0;
+        let is_word = opcodes[0] & 0x02 != 0;
         // mode is a 3-bit value: { opcode[0][0], opcode[1][7], opcode[1][6] }
-        let mode = ((opcode[0] & 0x01) << 2) | (opcode[1] >> 6);
+        let mode = ((opcodes[0] & 0x01) << 2) | (opcodes[1] >> 6);
 
-        let src = (opcode[1] >> 3) & 0x07;
-        let dst = opcode[1] & 0x07;
+        let src = (opcodes[1] >> 3) & 0x07;
+        let dst = opcodes[1] & 0x07;
 
         let src_regb = || RegByte::try_from(src).map_err(|x| InvalidRegister(x.0));
         let src_regw = || RegWord::try_from(src).map_err(|x| InvalidRegister(x.0));
@@ -175,9 +193,10 @@ impl Emulator {
 
         match mode {
             0 => {
-                // LEA: dst = src + signed_offset
-                opcode.push(self.next_opcode().ok_or(MemoryLookupFail(self.pc.0))?);
-                let offset = opcode[2].cast_signed() as i16 as u16;
+                // LEA off(%src), %dst:
+                // dst := src + off
+                self.push_next_opcode(&mut opcodes)?;
+                let offset = opcodes[2].cast_signed() as i16 as u16;
                 let value = self.reg_word(src_regw()?) + Wrapping(offset);
                 if !is_word {
                     self.set_reg_byte(dst_regb()?, value.0 as u8);
@@ -186,18 +205,20 @@ impl Emulator {
                 }
             }
             1 => {
-                // LDI: dst = immediate
+                // LDI $imm, %dst:
+                // dst := imm
                 if !is_word {
-                    opcode.push(self.next_opcode().ok_or(MemoryLookupFail(self.pc.0))?);
-                    self.set_reg_byte(dst_regb()?, opcode[2]);
+                    self.push_next_opcode(&mut opcodes)?;
+                    self.set_reg_byte(dst_regb()?, opcodes[2]);
                 } else {
-                    opcode.push(self.next_opcode().ok_or(MemoryLookupFail(self.pc.0))?);
-                    opcode.push(self.next_opcode().ok_or(MemoryLookupFail(self.pc.0))?);
-                    self.set_reg_word(dst_regw()?, u16::from_be_bytes([opcode[2], opcode[3]]));
+                    self.push_next_opcode(&mut opcodes)?;
+                    self.push_next_opcode(&mut opcodes)?;
+                    self.set_reg_word(dst_regw()?, u16::from_be_bytes([opcodes[2], opcodes[3]]));
                 }
             }
             2 => {
-                // MOV: dst = src
+                // MOV %src, %dst:
+                // dst := src
                 if !is_word {
                     let value = self.reg_byte(src_regb()?);
                     self.set_reg_byte(dst_regb()?, value.0);
@@ -207,7 +228,8 @@ impl Emulator {
                 }
             }
             3 => {
-                // LDI $0: dst = 0
+                // LDI $0, %dst:
+                // dst := 0
                 if !is_word {
                     self.set_reg_byte(dst_regb()?, 0);
                 } else {
@@ -215,56 +237,60 @@ impl Emulator {
                 }
             }
             4 => {
-                // LD offs: dst = mem[src + signed_offset]
-                opcode.push(self.next_opcode().ok_or(MemoryLookupFail(self.pc.0))?);
-                let offset = opcode[2].cast_signed() as i16 as u16;
+                // LD off(%src), %dst:
+                // dst := *(src + off)
+                self.push_next_opcode(&mut opcodes)?;
+                let offset = opcodes[2].cast_signed() as i16 as u16;
                 let address = (self.reg_word(src_regw()?) + Wrapping(offset)).0;
                 if !is_word {
                     let value = self.get(address).ok_or(MemoryLookupFail(address))?;
                     self.set_reg_byte(dst_regb()?, value);
                 } else {
-                    let value = self.get_u16(address).ok_or(MemoryLookupFail(address))?;
+                    let value = self.get_word(address).ok_or(MemoryLookupFail(address))?;
                     self.set_reg_word(dst_regw()?, value);
                 }
             }
             5 => {
-                // LD addr: dst = mem[absolute_address]
-                opcode.push(self.next_opcode().ok_or(MemoryLookupFail(self.pc.0))?);
-                opcode.push(self.next_opcode().ok_or(MemoryLookupFail(self.pc.0))?);
-                let address = u16::from_be_bytes([opcode[2], opcode[3]]);
+                // LD addr, %dst:
+                // dst := *addr
+                self.push_next_opcode(&mut opcodes)?;
+                self.push_next_opcode(&mut opcodes)?;
+                let address = u16::from_be_bytes([opcodes[2], opcodes[3]]);
                 if !is_word {
                     let value = self.get(address).ok_or(MemoryLookupFail(address))?;
                     self.set_reg_byte(dst_regb()?, value);
                 } else {
-                    let value = self.get_u16(address).ok_or(MemoryLookupFail(address))?;
+                    let value = self.get_word(address).ok_or(MemoryLookupFail(address))?;
                     self.set_reg_word(dst_regw()?, value);
                 }
             }
             6 => {
-                // STO offs: mem[src + signed_offset] = dst
-                opcode.push(self.next_opcode().ok_or(MemoryLookupFail(self.pc.0))?);
-                let offset = opcode[2].cast_signed() as i16 as u16;
+                // STO %src, off(%dst): %dst is at %src bitmask
+                // *(dst + off) := src
+                self.push_next_opcode(&mut opcodes)?;
+                let offset = opcodes[2].cast_signed() as i16 as u16;
                 let address = (self.reg_word(src_regw()?) + Wrapping(offset)).0;
                 if !is_word {
                     let value = self.reg_byte(dst_regb()?).0;
                     self.set(address, value).ok_or(MemoryLookupFail(address))?;
                 } else {
                     let value = self.reg_word(dst_regw()?).0;
-                    self.set_u16(address, value)
+                    self.set_word(address, value)
                         .ok_or(MemoryLookupFail(address))?;
                 }
             }
             7 => {
-                // STO addr: mem[absolute_address] = dst
-                opcode.push(self.next_opcode().ok_or(MemoryLookupFail(self.pc.0))?);
-                opcode.push(self.next_opcode().ok_or(MemoryLookupFail(self.pc.0))?);
-                let address = u16::from_be_bytes([opcode[2], opcode[3]]);
+                // STO %src, addr: %dst is at %src bitmask
+                // *addr := src
+                self.push_next_opcode(&mut opcodes)?;
+                self.push_next_opcode(&mut opcodes)?;
+                let address = u16::from_be_bytes([opcodes[2], opcodes[3]]);
                 if !is_word {
                     let value = self.reg_byte(dst_regb()?).0;
                     self.set(address, value).ok_or(MemoryLookupFail(address))?;
                 } else {
                     let value = self.reg_word(dst_regw()?).0;
-                    self.set_u16(address, value)
+                    self.set_word(address, value)
                         .ok_or(MemoryLookupFail(address))?;
                 }
             }
@@ -272,5 +298,64 @@ impl Emulator {
         }
 
         Ok(())
+    }
+
+    fn step_jump(&mut self, mut opcodes: Vec<u8>) -> Result<(), EmulatorError> {
+        use EmulatorError::*;
+
+        self.push_next_opcode(&mut opcodes)?;
+
+        let condition = opcodes[1] >> 4;
+        let is_offs: bool = (opcodes[1] >> 3) & 1 != 0;
+        let src = opcodes[1] & 7;
+
+        let src_regw = || RegWord::try_from(src).map_err(|x| InvalidRegister(x.0));
+
+        let address = if is_offs {
+            self.push_next_opcode(&mut opcodes)?;
+            (self.reg_word(src_regw()?) + Wrapping(opcodes[2].cast_signed() as i16 as u16)).0
+        } else {
+            self.push_next_opcode(&mut opcodes)?;
+            self.push_next_opcode(&mut opcodes)?;
+            u16::from_be_bytes([opcodes[2], opcodes[3]])
+        };
+
+        if (opcodes[0] & 1 == 0)
+            || self
+                .test_condition(Condition::try_from(condition).map_err(|x| InvalidCondition(x.0))?)
+        {
+            self.pc = Wrapping(address);
+        }
+
+        Ok(())
+    }
+
+    pub const fn check_flag(&self, flag: Flags) -> bool {
+        self.flags.0 & flag.as_mask() != 0
+    }
+
+    pub const fn test_condition(&self, condition: Condition) -> bool {
+        match condition {
+            Condition::Z => self.check_flag(Flags::ZF),
+            Condition::C => self.check_flag(Flags::CF),
+            Condition::S => self.check_flag(Flags::SF),
+            Condition::O => self.check_flag(Flags::OF),
+            Condition::BE => self.check_flag(Flags::ZF) || self.check_flag(Flags::CF),
+            Condition::L => self.check_flag(Flags::SF) ^ self.check_flag(Flags::OF),
+            Condition::LE => {
+                (self.check_flag(Flags::SF) ^ self.check_flag(Flags::OF))
+                    || self.check_flag(Flags::ZF)
+            }
+            Condition::NZ => !self.check_flag(Flags::ZF),
+            Condition::NC => !self.check_flag(Flags::CF),
+            Condition::NS => !self.check_flag(Flags::SF),
+            Condition::NO => !self.check_flag(Flags::OF),
+            Condition::NBE => !self.check_flag(Flags::ZF) && !self.check_flag(Flags::CF),
+            Condition::NL => !(self.check_flag(Flags::SF) ^ self.check_flag(Flags::OF)),
+            Condition::NLE => {
+                !(self.check_flag(Flags::SF) ^ self.check_flag(Flags::OF))
+                    && !self.check_flag(Flags::ZF)
+            }
+        }
     }
 }
