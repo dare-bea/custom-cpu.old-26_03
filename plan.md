@@ -1,4 +1,4 @@
-# CPU Architecture
+# CPU Architecture "2"
 
 ## Registers
 

@@ -129,20 +129,50 @@ impl Display for EmulatorError {
 
 impl std::error::Error for EmulatorError {}
 
+enum AluError {
+    EmulatorError(EmulatorError),
+    MissingOperation,
+}
+
+impl AluError {
+    pub fn to_emulator_error(self, opcodes: Vec<u8>) -> EmulatorError {
+        match self {
+            Self::EmulatorError(e) => e,
+            Self::MissingOperation => EmulatorError::OpcodeUndefined(opcodes),
+        }
+    }
+}
+
+impl From<EmulatorError> for AluError {
+    fn from(value: EmulatorError) -> Self {
+        Self::EmulatorError(value)
+    }
+}
+
 pub mod opcode {
-    /// An opcode of `0x00` is a NOP.
+    /// An opcode of `0xFF` is a NOP.
     pub const fn is_nop(opcode: u8) -> bool {
-        opcode == 0x00
+        opcode == 0xFF
     }
 
-    /// A data opcode is of form 0b0000_11xx.
+    /// A data opcode is of the form 0b0001_01xx.
     pub const fn is_data(opcode: u8) -> bool {
-        opcode & 0xFC == 0x0C
+        opcode & 0xFC == 0x14
     }
 
-    /// A jump opcode is of form 0b0000_10xx.
+    /// A jump opcode is of the form 0b0001_00xx.
     pub const fn is_jump(opcode: u8) -> bool {
-        opcode & 0xFC == 0x08
+        opcode & 0xFC == 0x10
+    }
+
+    /// A binary ALU opcode is of the form 0b0000_1xxx.
+    pub const fn is_alu_binary(opcode: u8) -> bool {
+        opcode & 0xF8 == 0x08
+    }
+
+    /// A unary ALU opcode is of the form 0b0000_0xxx.
+    pub const fn is_alu_unary(opcode: u8) -> bool {
+        opcode & 0xF8 == 0x00
     }
 }
 
@@ -153,6 +183,35 @@ impl Emulator {
                 .ok_or(EmulatorError::MemoryLookupFail(self.pc.0))?,
         );
         Ok(())
+    }
+    
+        pub const fn check_flag(&self, flag: Flags) -> bool {
+        self.flags.0 & flag.as_mask() != 0
+    }
+
+    pub const fn test_condition(&self, condition: Condition) -> bool {
+        match condition {
+            Condition::Z => self.check_flag(Flags::ZF),
+            Condition::C => self.check_flag(Flags::CF),
+            Condition::S => self.check_flag(Flags::SF),
+            Condition::O => self.check_flag(Flags::OF),
+            Condition::BE => self.check_flag(Flags::ZF) || self.check_flag(Flags::CF),
+            Condition::L => self.check_flag(Flags::SF) ^ self.check_flag(Flags::OF),
+            Condition::LE => {
+                (self.check_flag(Flags::SF) ^ self.check_flag(Flags::OF))
+                    || self.check_flag(Flags::ZF)
+            }
+            Condition::NZ => !self.check_flag(Flags::ZF),
+            Condition::NC => !self.check_flag(Flags::CF),
+            Condition::NS => !self.check_flag(Flags::SF),
+            Condition::NO => !self.check_flag(Flags::OF),
+            Condition::NBE => !self.check_flag(Flags::ZF) && !self.check_flag(Flags::CF),
+            Condition::NL => !(self.check_flag(Flags::SF) ^ self.check_flag(Flags::OF)),
+            Condition::NLE => {
+                !(self.check_flag(Flags::SF) ^ self.check_flag(Flags::OF))
+                    && !self.check_flag(Flags::ZF)
+            }
+        }
     }
 
     pub fn step(&mut self) -> Result<(), EmulatorError> {
@@ -169,6 +228,12 @@ impl Emulator {
         } else if opcode::is_jump(opcodes[0]) {
             // JMP or JCC.
             self.step_jump(opcodes)
+        } else if opcode::is_alu_binary(opcodes[0]) {
+            // Binary ALU operation.
+            self.step_alu_binary(opcodes)
+        } else if opcode::is_alu_unary(opcodes[0]) {
+            // Unary ALU operation.
+            self.step_alu_unary(opcodes)
         } else {
             Err(OpcodeUndefined(opcodes))
         }
@@ -330,32 +395,92 @@ impl Emulator {
         Ok(())
     }
 
-    pub const fn check_flag(&self, flag: Flags) -> bool {
-        self.flags.0 & flag.as_mask() != 0
+    fn step_alu_binary(&mut self, mut opcodes: Vec<u8>) -> Result<(), EmulatorError> {
+        use EmulatorError::*;
+
+        self.push_next_opcode(&mut opcodes)?;
+
+        let operation = opcodes[0] & 7;
+        let is_word = opcodes[1] & 0x80 != 0;
+        let is_imm = opcodes[1] & 0x40 != 0;
+
+        let src = (opcodes[1] >> 3) & 0x07;
+        let dst = opcodes[1] & 0x07;
+
+        let src_regb = || RegByte::try_from(src).map_err(|x| InvalidRegister(x.0));
+        let src_regw = || RegWord::try_from(src).map_err(|x| InvalidRegister(x.0));
+        let dst_regb = || RegByte::try_from(dst).map_err(|x| InvalidRegister(x.0));
+        let dst_regw = || RegWord::try_from(dst).map_err(|x| InvalidRegister(x.0));
+
+        if is_word {
+            let lhs = self.reg_byte(dst_regb()?).0;
+            let rhs = if is_imm {
+                self.push_next_opcode(&mut opcodes)?;
+                opcodes[2]
+            } else {
+                self.reg_byte(src_regb()?).0
+            };
+            let value = self.step_alu_binary_byte(operation, lhs, rhs).map_err(|e| e.to_emulator_error(opcodes))?;
+            self.set_reg_byte(dst_regb()?, value);
+        } else {
+            let lhs = self.reg_word(dst_regw()?).0;
+            let rhs = if is_imm {
+                self.push_next_opcode(&mut opcodes)?;
+                self.push_next_opcode(&mut opcodes)?;
+                u16::from_be_bytes([opcodes[2], opcodes[3]])
+            } else {
+                self.reg_word(src_regw()?).0
+            };
+            let value = self.step_alu_binary_word(operation, lhs, rhs).map_err(|e| e.to_emulator_error(opcodes))?;
+            self.set_reg_word(dst_regw()?, value);
+        }
+
+        Ok(())
     }
 
-    pub const fn test_condition(&self, condition: Condition) -> bool {
-        match condition {
-            Condition::Z => self.check_flag(Flags::ZF),
-            Condition::C => self.check_flag(Flags::CF),
-            Condition::S => self.check_flag(Flags::SF),
-            Condition::O => self.check_flag(Flags::OF),
-            Condition::BE => self.check_flag(Flags::ZF) || self.check_flag(Flags::CF),
-            Condition::L => self.check_flag(Flags::SF) ^ self.check_flag(Flags::OF),
-            Condition::LE => {
-                (self.check_flag(Flags::SF) ^ self.check_flag(Flags::OF))
-                    || self.check_flag(Flags::ZF)
+    fn step_alu_binary_byte(&mut self, operation: u8, lhs: u8, rhs: u8) -> Result<u8, AluError> {
+        Ok(match operation {
+            0 => {
+                // add
+                self.flags.0 &= !(
+                    Flags::ZF.as_mask()
+                    | Flags::CF.as_mask()
+                    | Flags::SF.as_mask()
+                    | Flags::OF.as_mask()
+                );
+                let oflag = lhs.cast_signed().checked_add(rhs.cast_signed()).is_none();
+                let (value, cflag) = lhs.overflowing_add(rhs);
+                if value == 0 {self.flags.0 |= Flags::ZF.as_mask();}
+                if value.cast_signed().is_negative() {self.flags.0 |= Flags::SF.as_mask();}
+                if oflag {self.flags.0 |= Flags::OF.as_mask();}
+                if cflag {self.flags.0 |= Flags::CF.as_mask();}
+                value
             }
-            Condition::NZ => !self.check_flag(Flags::ZF),
-            Condition::NC => !self.check_flag(Flags::CF),
-            Condition::NS => !self.check_flag(Flags::SF),
-            Condition::NO => !self.check_flag(Flags::OF),
-            Condition::NBE => !self.check_flag(Flags::ZF) && !self.check_flag(Flags::CF),
-            Condition::NL => !(self.check_flag(Flags::SF) ^ self.check_flag(Flags::OF)),
-            Condition::NLE => {
-                !(self.check_flag(Flags::SF) ^ self.check_flag(Flags::OF))
-                    && !self.check_flag(Flags::ZF)
+            1 => {
+                // sub
+                self.flags.0 &= !(
+                    Flags::ZF.as_mask()
+                    | Flags::CF.as_mask()
+                    | Flags::SF.as_mask()
+                    | Flags::OF.as_mask()
+                );
+                let oflag = lhs.cast_signed().checked_sub(rhs.cast_signed()).is_none();
+                let (value, cflag) = lhs.overflowing_sub(rhs);
+                if value == 0 {self.flags.0 |= Flags::ZF.as_mask();}
+                if value.cast_signed().is_negative() {self.flags.0 |= Flags::SF.as_mask();}
+                if oflag {self.flags.0 |= Flags::OF.as_mask();}
+                if cflag {self.flags.0 |= Flags::CF.as_mask();}
+                value
             }
-        }
+            _ => return Err(AluError::MissingOperation)
+        })
+    }
+
+    fn step_alu_binary_word(&mut self, _operation: u8, _lhs: u16, _rhs: u16) -> Result<u16, AluError> {
+        todo!()
+    }
+
+    fn step_alu_unary(&mut self, _opcodes: Vec<u8>) -> Result<(), EmulatorError> {
+        todo!()
     }
 }
